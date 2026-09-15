@@ -1,0 +1,17 @@
+# cbed_gui.py 直接依赖（版本取自 temsim conda 环境）
+# 安装：conda create -n temsim python=3.x && pip install -r requirements.txt
+# 说明：
+#   - tkinter 为标准库（Windows 的官方 Python 自带，无需 pip 安装）
+#   - abtem 只用于右侧 CBED 多片法模拟；不模拟 CBED 时可用
+#     pip install abtem[dask,opencv] 按需，仅核心需装 abtem
+#   - scipy 为 diffsims/orix 的传递依赖，列出以便环境自洽
+
+numpy==2.4.6
+scipy==1.17.1
+matplotlib==3.11.1
+ase==3.29.0
+abtem==1.0.10
+diffsims==0.7.0
+orix==0.15.0
+diffpy.structure==3.3.1
+Pillow==12.3.0

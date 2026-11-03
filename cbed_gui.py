@@ -54,10 +54,12 @@ DEFAULTS = {
     "cam_len": 30.56,          # 相机长度(L)：参考圆半径 rmax = L·tan(2θ_max)，
                                # θ_max=arcsin(λ·gmax/2) 为 gmax 探测口径对应的最大布拉格半角。
                                # 默认 L 使 gmax=1.2、200keV(λ=0.02508Å) 时 rmax≈0.92，与旧观感一致。
-    "exc_spot": 0.10,          # 衍射斑最大激发误差 s_g (1/Å)：s≥此值的反射直接剔除（硬门限）。
-                               # 稍大→更多斑持续显示、位置连续，避免转动时离散跳变
-    "exc_width": 0.02,         # 激发包络半宽 σ (1/Å)：Lorentzian env=1/(1+(s/σ)²)。
-                               # 越小→斑点随激发误差衰减越快，弱激发斑快速淡出、数量显著减少。
+    "exc_spot": 0.04,          # 衍射斑最大激发误差 s_g (1/Å)：|s|≥此值的反射直接剔除（硬门限）。
+                               # 越小→远角/离轴弱斑随倾转更快消失；太大(如0.10)会有大量
+                               # 远处的弱斑残存、难以用倾斜消除。
+    "exc_width": 0.02,         # 激发包络半宽 σ (1/Å)：Gaussian env=exp(-(s/σ)²)。
+                               # 越小→斑点随激发误差衰减越快(比 Lorentzian 尾部更陡)，
+                               # 弱激发斑快速淡出、数量显著减少；σ=0.05 的尾部太宽会显示大量弱斑。
                                # 物理上 s·t 相位累积大（t≈200Å 时 s=0.05 已累积 31rad），
                                # 离轴反射应近零强度；σ=0.05 的尾部太宽会显示大量弱斑。
     "band_max": 0.85,          # 绘制菊池带的最大 |g| (1/Å)，避免带过密
@@ -72,9 +74,22 @@ DEFAULTS = {
     "sampling": 0.2,           # 实空间采样 (Å/px)
     "scalebar_nm": 5.0,        # 导出 CBED 图底部标尺长度 (nm^-1)，默认 5
     "dpi": 150,                # CBED 出图分辨率
+    # STEM 原子像
+    "stem_row_chunk": 8,       # 手动分块扫描时每批的扫描行数。STEM 扫描必须分批，
+                               # 否则 abTEM lazy=False 会一次性物化"全部扫描位置 × 势网格"
+                               # (如 128×128×1080×1080 complex64) 而内存爆炸。
+                               # 分批后单批内存 ≈ row_chunk×gx×(势网格)，可线性控内存。
 }
 
 Z_AXIS = np.array([0.0, 0.0, 1.0])
+
+# 电镜双倾样品杆的旋转轴方向选项（实验室/绘图区坐标，屏幕 +X 向右、+Y 向上）
+TEM_TILT_AXES = {
+    "向下 (−Y)": (0.0, -1.0, 0.0),
+    "向上 (+Y)": (0.0, 1.0, 0.0),
+    "向右 (+X)": (1.0, 0.0, 0.0),
+    "向左 (−X)": (-1.0, 0.0, 0.0),
+}
 
 
 # =============================================================================
@@ -135,8 +150,8 @@ def Rz(angle):
 def rotation_about_axis(d, angle):
     """绕任意单位轴 d 的主动旋转矩阵（左乘列向量）：v' = R @ v。
 
-    与 Rx/Ry/Rz 同族；用于绕 XY 平面内旋转轴 d 旋转 angle 弧度，
-    作用方式同 _on_motion 拖拽：self.R = project_beam_aligned(self.R @ R)。
+    与 Rx/Ry/Rz 同族；用于绕 XY 平面内旋转轴 d 旋转 angle 弧度。
+    作用方式同 _on_motion 拖拽：左乘 self.R，即绕实验室固定轴转晶体（束不动）。
     """
     d = np.asarray(d, float)
     n = np.linalg.norm(d)
@@ -148,25 +163,6 @@ def rotation_about_axis(d, angle):
                   [d[2], 0, -d[0]],
                   [-d[1], d[0], 0]])
     return np.eye(3) + s * k + (1.0 - c) * (k @ k)
-
-
-def project_beam_aligned(R):
-    """把任意取向 R 投影成“束(实验室 z) 恒沿晶带轴”的取向，返回满足 R@n = z 的矩阵。
-
-    样品片取在垂直于带轴的平面，束沿带轴入射 ⇒ 样品面恒⊥束、束恒⊥样品面，
-    原子柱平行于束，ABTEM 切片正交于原子柱（不产生“斜格”）。
-    分解 R = Rz(φ) @ rotation_align(n, z)，其中 n=带轴在晶体中方向，φ 为绕束的面内角；
-    返回 Rz(φ)@rotation_align(n,z)，横向随拖拽连续变化。
-    """
-    n = R.T @ Z_AXIS
-    nl = np.linalg.norm(n)
-    if nl < 1e-12:
-        return np.eye(3)
-    n = n / nl
-    Align = rotation_align(n, Z_AXIS)
-    M = R @ Align.T
-    phi = np.arctan2(M[1, 0], M[0, 0])
-    return Rz(phi) @ Align
 
 
 def reciprocal_basis(cell):
@@ -417,6 +413,11 @@ class CBEDApp:
         # CBED 提供原子位置的功能沿用"束框=实验室坐标"，其内部用旧(行)约定
         # 计算，经边界传 self.R.T 接入。
         self.R = np.eye(3)
+        # 电镜倾转：“设置当前倾转角”只记录读数、不改变下方花样，并反推电镜 0
+        # 倾转状态 R_0 = [Rα(α) Rβ(β)]ᵀ @ R；目标倾转面板再由 R_0 起算
+        # R = Rα(α_tgt) @ Rβ(β_tgt) @ R_0。
+        self._tem_tilt_R0 = None
+
         self.g_list = []           # [(hkl, g)]
         self.F2 = {}               # hkl -> F^2
         self.phase = None          # orix Phase（用于 diffsims 衍射斑）
@@ -431,6 +432,13 @@ class CBEDApp:
         self._redraw_pending = False   # 节流重绘标志（合并高频 motion 事件）
         self._result_q = queue.Queue()
         self._running = False
+        self._cancel_event = threading.Event()
+
+        # ---- STEM 原子像独立运行状态/队列/取消 ----
+        self._stem_result_q = queue.Queue()
+        self._stem_running = False
+        self._stem_cancel = threading.Event()
+        self._stem_start = None
 
         # ---- 旋转操控盘（绕 XY 平面内直径方向旋转）----
         self._rot_phi = 0.0            # 指针角（弧度，0=+X，π/2=+Y，页面上为向右/向上）
@@ -467,7 +475,8 @@ class CBEDApp:
         self._build_right_panel(self.right)
         self.fig_right = Figure(figsize=(4.6, 4.9), dpi=100)
         self.ax_right = self.fig_right.add_subplot(111)
-        self.canvas_right = FigureCanvasTkAgg(self.fig_right, master=self.right)
+        # CBED 画布放进"CBED 控制"选项卡内（fill both expand），而非右侧整体
+        self.canvas_right = FigureCanvasTkAgg(self.fig_right, master=self.cbed_tab)
         self.canvas_right.get_tk_widget().pack(fill="both", expand=True)
         # 右侧 CBED：滚轮缩放（围绕光标，约束在全幅内）
         self.canvas_right.mpl_connect("scroll_event", self._on_cbed_scroll)
@@ -491,6 +500,11 @@ class CBEDApp:
         row0.pack(fill="x", padx=4, pady=2)
         self.cif_label = tk.StringVar(value="未加载 CIF")
         ttk.Button(row0, text="导入 CIF", command=self._on_import_cif).pack(side="left")
+        # 导入 CIF 后此处显示 化学式(_chemical_formula_structural) + 空间群符号
+        self.crystal_info_label = tk.StringVar(value="")
+        ttk.Label(row0, textvariable=self.crystal_info_label,
+                  foreground="#3366cc", font=("", 9)).pack(
+            side="left", padx=(6, 0))
 
         row1 = ttk.Frame(left_c)
         row1.pack(fill="x", padx=4, pady=2)
@@ -523,7 +537,7 @@ class CBEDApp:
 
         # ---------- 右列：旋转操控盘（绕 XY 平面内任意直径方向旋转）----------
         # 指针方向确定旋转轴 d，圆下输入旋转角（mrad），确认后按
-        # self.R ← project_beam_aligned(self.R @ rotation_about_axis(d, θ))，
+        # self.R ← rotation_about_axis(d, θ) @ self.R（左乘，绕实验室固定轴转晶体），
         # 与拖拽旋转（Rx/Ry）同族。
         right_c = ttk.Frame(crystal_row)
         right_c.pack(side="left", fill="y", anchor="n", padx=(0, 4))
@@ -567,6 +581,77 @@ class CBEDApp:
         dial.bind("<B1-Motion>", self._on_dial_drag)
         self._draw_dial()
 
+        # ============================ 选项卡：电镜倾转 ============================
+        # 双倾样品杆：α、β 两个倾转轴（实验室/绘图区坐标）。α 轴默认向下(−Y)，
+        # β 轴默认向右(+X)。目标状态 R = Rα(α) @ Rβ(β) @ R_0（先 β 后 α）：
+        # β 轴随样品杆 α 角一起转动，故必须在 α 未动时先绕 β 轴转，再绕 α 轴转。
+        # “设置当前倾转角”只是记录当前花样的读数（不旋转），供目标倾转起算。
+        tab_tem_tilt = ttk.Frame(nb)
+        nb.add(tab_tem_tilt, text="电镜倾转")
+
+        frame_tem_tilt_cur = ttk.LabelFrame(tab_tem_tilt, text="设置当前倾转角")
+        frame_tem_tilt_cur.pack(fill="x", padx=4, pady=(4, 2))
+
+        row_tem_tilt_alpha = ttk.Frame(frame_tem_tilt_cur)
+        row_tem_tilt_alpha.pack(fill="x", padx=4, pady=2)
+        ttk.Label(row_tem_tilt_alpha, text="α 倾转角").pack(side="left")
+        self.tem_tilt_alpha_var = tk.StringVar(value="0.0")
+        ttk.Entry(row_tem_tilt_alpha, textvariable=self.tem_tilt_alpha_var, width=7).pack(
+            side="left", padx=2)
+        ttk.Label(row_tem_tilt_alpha, text="°").pack(side="left")
+        ttk.Label(row_tem_tilt_alpha, text="α 旋转轴").pack(side="left", padx=(12, 2))
+        self.tem_tilt_alpha_axis_var = tk.StringVar(value="向下 (−Y)")
+        ttk.Combobox(row_tem_tilt_alpha, textvariable=self.tem_tilt_alpha_axis_var, width=10,
+                     state="readonly",
+                     values=list(TEM_TILT_AXES.keys())).pack(side="left")
+
+        row_tem_tilt_beta = ttk.Frame(frame_tem_tilt_cur)
+        row_tem_tilt_beta.pack(fill="x", padx=4, pady=2)
+        ttk.Label(row_tem_tilt_beta, text="β 倾转角").pack(side="left")
+        self.tem_tilt_beta_var = tk.StringVar(value="0.0")
+        ttk.Entry(row_tem_tilt_beta, textvariable=self.tem_tilt_beta_var, width=7).pack(
+            side="left", padx=2)
+        ttk.Label(row_tem_tilt_beta, text="°").pack(side="left")
+        ttk.Label(row_tem_tilt_beta, text="β 旋转轴").pack(side="left", padx=(12, 2))
+        self.tem_tilt_beta_axis_var = tk.StringVar(value="向右 (+X)")
+        ttk.Combobox(row_tem_tilt_beta, textvariable=self.tem_tilt_beta_axis_var, width=10,
+                     state="readonly",
+                     values=list(TEM_TILT_AXES.keys())).pack(side="left")
+
+        row_tem_tilt_apply = ttk.Frame(frame_tem_tilt_cur)
+        row_tem_tilt_apply.pack(fill="x", padx=4, pady=(0, 2))
+        ttk.Button(row_tem_tilt_apply, text="设置当前倾转角",
+                   command=self._on_set_current_tem_tilt).pack(side="left")
+        self.tem_tilt_info_var = tk.StringVar(
+            value="尚未记录当前倾转（按 α = β = 0° 处理）")
+        ttk.Label(frame_tem_tilt_cur, textvariable=self.tem_tilt_info_var,
+                  foreground="#3366cc", font=("", 9)).pack(
+            fill="x", padx=8, pady=(0, 2))
+
+        ttk.Label(tab_tem_tilt,
+                  text="注：β 轴实际随样品杆的 α 角一起转动，故模拟时须在 α 未动时"
+                       "先旋转 β，再旋转 α（即先 β 后 α），倾斜结果才正确。",
+                  foreground="#888", font=("", 9), justify="left",
+                  wraplength=560).pack(fill="x", padx=8, pady=(0, 4))
+
+        frame_tem_tilt_target = ttk.LabelFrame(tab_tem_tilt, text="设置目标倾转角")
+        frame_tem_tilt_target.pack(fill="x", padx=4, pady=(2, 4))
+
+        row_tem_tilt_target = ttk.Frame(frame_tem_tilt_target)
+        row_tem_tilt_target.pack(fill="x", padx=4, pady=2)
+        ttk.Label(row_tem_tilt_target, text="α 倾转角").pack(side="left")
+        self.tem_tilt_target_alpha_var = tk.StringVar(value="0.0")
+        ttk.Entry(row_tem_tilt_target, textvariable=self.tem_tilt_target_alpha_var, width=7).pack(
+            side="left", padx=2)
+        ttk.Label(row_tem_tilt_target, text="°").pack(side="left")
+        ttk.Label(row_tem_tilt_target, text="β 倾转角").pack(side="left", padx=(12, 2))
+        self.tem_tilt_target_beta_var = tk.StringVar(value="0.0")
+        ttk.Entry(row_tem_tilt_target, textvariable=self.tem_tilt_target_beta_var, width=7).pack(
+            side="left", padx=2)
+        ttk.Label(row_tem_tilt_target, text="°").pack(side="left")
+        ttk.Button(row_tem_tilt_target, text="确定",
+                   command=self._on_set_target_tem_tilt).pack(side="left", padx=(16, 0))
+
         # ============================ 选项卡：样品信息 ============================
         tab_sample = ttk.Frame(nb)
         nb.add(tab_sample, text="样品信息")
@@ -592,6 +677,13 @@ class CBEDApp:
             side="left", padx=2)
         ttk.Label(row3b, text="(势场/波实空间采样)", foreground="#888").pack(
             side="left", padx=4)
+        # 实空间采样决定倒空间奈奎斯特截止，即 CBED 可见的散射半角上限
+        self._nyq_half_var = tk.StringVar()
+        ttk.Label(row3b, textvariable=self._nyq_half_var, foreground="#888").pack(
+            side="left", padx=4)
+        self.sampling_var.trace_add("write", lambda *_: self._update_nyq_half())
+        self.energy_var.trace_add("write", lambda *_: self._update_nyq_half())
+        self._update_nyq_half()
 
         # ============================ 选项卡：显示 ============================
         tab_disp = ttk.Frame(nb)
@@ -650,7 +742,16 @@ class CBEDApp:
         self.bright_var.trace_add("write", _bright_label)
 
     def _build_right_panel(self, parent):
-        f = ttk.LabelFrame(parent, text="CBED 控制")
+        # 右侧整体改为外层 Notebook：两个选项卡——"CBED 控制"（原全部内容）
+        # 与"STEM 原子像"。各自含参数面板 + 独立的 matplotlib 画布。
+        self.right_nb = ttk.Notebook(parent)
+        self.right_nb.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # ---- 选项卡：CBED 控制（含内部"CBED 参数/导出设置/显示"子选项卡）----
+        self.cbed_tab = ttk.Frame(self.right_nb)
+        self.right_nb.add(self.cbed_tab, text="CBED 控制")
+
+        f = ttk.LabelFrame(self.cbed_tab, text="CBED 控制")
         f.pack(fill="x", padx=4, pady=4)
         nb = ttk.Notebook(f)
         nb.pack(fill="x", padx=4, pady=4)
@@ -680,6 +781,9 @@ class CBEDApp:
         bar.pack(fill="x", padx=4, pady=4)
         self.cbed_btn = ttk.Button(bar, text="CBED 模拟", command=self._on_cbed)
         self.cbed_btn.pack(side="left")
+        self.cbed_cancel_btn = ttk.Button(bar, text="取消模拟",
+                                          command=self._cancel_cbed, state="disabled")
+        self.cbed_cancel_btn.pack(side="left", padx=(6, 0))
 
         # ============================ 选项卡：导出设置 ============================
         tab_export = ttk.Frame(nb)
@@ -744,6 +848,239 @@ class CBEDApp:
         self.cbed_time_var = tk.StringVar(value="")
         ttk.Label(f, textvariable=self.cbed_time_var, foreground="#3366cc").pack(
             side="bottom", anchor="w", padx=6, pady=(0, 3))
+
+        # ---- 选项卡：STEM 原子像 ----
+        self.stem_tab = ttk.Frame(self.right_nb)
+        self.right_nb.add(self.stem_tab, text="STEM 原子像")
+        self._build_stem_panel(self.stem_tab)
+
+    # ------------------------------------------------------------------ STEM 原子像
+    def _build_stem_panel(self, parent):
+        """构建"STEM 原子像"选项卡：abTEM 所需参数 + 开始/取消按钮 + 画布 + 状态。"""
+        f = ttk.LabelFrame(parent, text="STEM 原子像控制")
+        f.pack(fill="x", padx=4, pady=4)
+
+        def field(frame, label, key, defv, unit="", width=6):
+            r = ttk.Frame(frame)
+            r.pack(fill="x", padx=4, pady=2)
+            ttk.Label(r, text=label, width=13).pack(side="left")
+            var = tk.StringVar(value=str(defv))
+            setattr(self, key, var)
+            ttk.Entry(r, textvariable=var, width=width).pack(side="left", padx=2)
+            if unit:
+                ttk.Label(r, text=unit, foreground="#888").pack(side="left", padx=2)
+
+        # 第 1 组：能量 / 厚度
+        row = ttk.Frame(f); row.pack(fill="x")
+        field(row, "加速电压", "stem_energy_var", self.cfg.get("energy_kev", 200.0), "keV")
+        field(row, "厚度", "stem_thick_var", self.cfg.get("thickness_nm", 20.0), "nm")
+        # 第 2 组：横向边长 / 采样
+        row = ttk.Frame(f); row.pack(fill="x")
+        field(row, "横向边长", "stem_width_var", self.cfg.get("box_width_nm", 10.8), "nm")
+        field(row, "采样", "stem_sampling_var", 0.1, "Å/px")
+        # 第 3 组：会聚半角 / 离焦 (C1)
+        row = ttk.Frame(f); row.pack(fill="x")
+        field(row, "会聚半角", "stem_semi_var", 25.0, "mrad")
+        field(row, "离焦 (C1)", "stem_defocus_var", 0.0, "Å")
+        # 第 4 组：环形探测器内/外角
+        row = ttk.Frame(f); row.pack(fill="x")
+        field(row, "探测器内角", "stem_inner_var", 60.0, "mrad")
+        field(row, "探测器外角", "stem_outer_var", 200.0, "mrad")
+        # 第 5 组：扫描点数（每边）
+        row = ttk.Frame(f); row.pack(fill="x")
+        field(row, "扫描点数/边", "stem_gpts_var", 128, "")
+
+        bar = ttk.Frame(f); bar.pack(fill="x", padx=4, pady=4)
+        self.stem_btn = ttk.Button(bar, text="STEM 模拟", command=self._on_stem)
+        self.stem_btn.pack(side="left")
+        self.stem_cancel_btn = ttk.Button(bar, text="取消模拟",
+                                          command=self._cancel_stem,
+                                          state="disabled")
+        self.stem_cancel_btn.pack(side="left", padx=(6, 0))
+
+        # 底部独立画布显示 STEM 结果（HAADF 原子像）
+        self.fig_stem = Figure(figsize=(4.6, 4.9), dpi=100)
+        self.ax_stem = self.fig_stem.add_subplot(111)
+        self.canvas_stem = FigureCanvasTkAgg(self.fig_stem, master=parent)
+        self.canvas_stem.get_tk_widget().pack(fill="both", expand=True)
+
+        self.stem_status = tk.StringVar(value="就绪")
+        ttk.Label(parent, textvariable=self.stem_status, foreground="#888").pack(
+            anchor="w", padx=6)
+        self.stem_time_var = tk.StringVar(value="")
+        ttk.Label(parent, textvariable=self.stem_time_var, foreground="#3366cc").pack(
+            anchor="w", padx=6, pady=(0, 3))
+
+    def _on_stem(self):
+        """读取 STEM 参数并以当前取向 self.R 启动后台多片法 STEM 模拟。"""
+        if self.atoms is None:
+            messagebox.showinfo("提示", "请先导入 CIF 文件")
+            return
+        if self._stem_running:
+            return
+
+        def rd(var, name):
+            v = self._read_float(var, name)
+            if v is None:
+                raise ValueError(name)
+            return v
+        try:
+            params = {}
+            params["energy_kev"] = rd(self.stem_energy_var, "加速电压")
+            params["thickness_nm"] = max(0.0, rd(self.stem_thick_var, "厚度"))
+            params["width_nm"] = max(0.1, rd(self.stem_width_var, "横向边长"))
+            params["sampling"] = max(0.01, rd(self.stem_sampling_var, "采样"))
+            params["semiangle_mrad"] = max(0.01, rd(self.stem_semi_var, "会聚半角"))
+            params["defocus_ang"] = rd(self.stem_defocus_var, "离焦")
+            params["inner_mrad"] = max(0.0, rd(self.stem_inner_var, "探测器内角"))
+            params["outer_mrad"] = max(0.0, rd(self.stem_outer_var, "探测器外角"))
+            params["gpts"] = int(max(8, rd(self.stem_gpts_var, "扫描点数")))
+        except ValueError:
+            return
+
+        if params["thickness_nm"] <= 0:
+            messagebox.showinfo("提示", "STEM 原子像需要正样品厚度 (>0)")
+            return
+        if params["inner_mrad"] <= params["semiangle_mrad"]:
+            self.stem_status.set("提示:内角未大于会聚半角,HAADF 可能无信号")
+        if params["outer_mrad"] <= params["inner_mrad"]:
+            self.stem_status.set("提示:外角需大于内角")
+
+        # 快照当前取向，保证与左面板后续拖拽无关。
+        params["_snap_R"] = np.array(self.R, float)
+
+        self._stem_running = True
+        self._stem_cancel.clear()
+        self.stem_btn.config(state="disabled")
+        self.stem_cancel_btn.config(state="normal")
+        self.stem_status.set("计算中…（大超胞/大扫描网格可能需数分钟）")
+        self.stem_time_var.set("")
+        self._stem_start = time.time()
+
+        t = threading.Thread(target=self._stem_worker, args=(params,), daemon=True)
+        t.start()
+        self.root.after(150, self._poll_stem_result)
+
+    def _cancel_stem(self):
+        """请求取消本次 STEM 模拟。worker 在关键步骤检查标志后尽快返回。"""
+        self._stem_cancel.set()
+        self.stem_btn.config(state="disabled")
+        self.stem_cancel_btn.config(state="disabled")
+        self.stem_status.set("正在取消…")
+
+    def _stem_worker(self, params):
+        """后台多片法 STEM（HAADF）：构造束框原子→翻转→势→Probe。
+
+        扫描必须**手动按行分批**（lazy=False 每批），否则 abTEM 一次性物化
+        "全部扫描位置 × 势网格" 的探针波（如 128×128×1080×1080 complex64）
+        → 内存爆炸（实测 Ti 001 默认参数下报 142 GiB 分配失败）。abTEM 的
+        lazy 分块路径在此版本有 bug（"too many indices"），故用手动分批。
+        abTEM scan 数组轴序为 (x, y)（已验证与一次性结果逐点一致，diff=0）。
+        """
+        try:
+            import abtem
+            R = params["_snap_R"]
+            wx = params["width_nm"] * 10.0     # nm -> Å
+            wy = wx
+            t = params["thickness_nm"] * 10.0
+
+            atoms = self._build_box_fill(R, wx, wy, t)
+            atoms = self._flip_to_plus_z(atoms)     # 转第二类模型（束 +z）
+            if self._stem_cancel.is_set():
+                return
+
+            potential = abtem.Potential(atoms, sampling=params["sampling"])
+            probe = abtem.Probe(energy=params["energy_kev"] * 1e3,
+                                semiangle_cutoff=params["semiangle_mrad"],
+                                aberrations={"defocus": params["defocus_ang"]},
+                                sampling=params["sampling"])
+
+            # 探测器外角不得超出"势/探针网格"能表示的最大衍射角（奈奎斯特限），
+            # 否则 abTEM 的 radial 积分直接抛 RuntimeError。此处按采样换算自动截断。
+            #   格点最大倒易矢 k_max = 1/(2·sampling)；散射半角 sinθ = λ·k_max/2
+            lam = self._wavelength  # Å
+            th_max = np.degrees(np.arcsin(lam / (2.0 * 2.0 * params["sampling"]))) * 1000.0
+            inner = params["inner_mrad"]
+            outer = params["outer_mrad"]
+            outer = max(inner + params["sampling"], min(outer, th_max * 0.98))
+
+            det = abtem.AnnularDetector(inner=inner, outer=outer)
+
+            g = params["gpts"]
+            gx = gy = g
+            dy = wy / gy
+            row_chunk = int(self.cfg.get("stem_row_chunk", 8))
+            out = np.zeros((gx, gy), dtype=np.float32)
+
+            for k in range(0, gy, row_chunk):
+                if self._stem_cancel.is_set():
+                    return
+                n = min(row_chunk, gy - k)
+                sub = abtem.GridScan(start=(0.0, dy * k),
+                                     end=(wx, dy * (k + n)),
+                                     gpts=(gx, n))
+                arr = np.asarray(probe.scan(potential, scan=sub,
+                                            detectors=[det],
+                                            lazy=False).array)
+                arr = np.squeeze(arr).astype(np.float32)
+                if arr.ndim == 2 and arr.shape != (gx, n):
+                    arr = arr.T          # 防御：确保轴序为 (x, y)
+                out[:, k:k+n] = arr
+
+            if self._stem_cancel.is_set():
+                return
+            self._stem_result_q.put(("ok", out, params))
+        except Exception as e:
+            import traceback
+            self._stem_result_q.put(("err", traceback.format_exc()))
+
+    def _poll_stem_result(self):
+        try:
+            msg = self._stem_result_q.get_nowait()
+        except queue.Empty:
+            if self._stem_running:
+                self.root.after(150, self._poll_stem_result)
+            return
+        self._stem_running = False
+        self.stem_btn.config(state="normal")
+        self.stem_cancel_btn.config(state="disabled")
+        if self._stem_cancel.is_set():
+            self._show_stem_elapsed()
+            self.stem_status.set("已取消")
+            return
+        if msg[0] == "err":
+            self.stem_status.set("失败")
+            self._show_stem_elapsed()
+            messagebox.showerror("STEM 计算失败", msg[1])
+            return
+        _, arr, params = msg
+        self._draw_stem(arr, params)
+        self.stem_status.set("完成")
+        self._show_stem_elapsed()
+
+    def _draw_stem(self, arr, params):
+        """绘制 HAADF-STEM 原子像（明原子亮），并给颜色条与标题。"""
+        ax = self.ax_stem
+        ax.clear()
+        d = np.asarray(arr, float)
+        d[np.isnan(d)] = 0.0
+        vmax = float(np.nanmax(d)) if d.size else 1.0
+        vmin = float(np.nanmin(d)) if d.size else 0.0
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+        im = ax.imshow(d, cmap="gray", origin="lower", aspect="equal",
+                       vmin=vmin, vmax=vmax, interpolation="nearest")
+        ax.set_title(f"HAADF-STEM  t={params['thickness_nm']:g} nm, "
+                     f"{params['inner_mrad']:g}-{params['outer_mrad']:g} mrad")
+        cb = self.fig_stem.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cb.set_label("强度 (arb. u.)")
+        self.canvas_stem.draw_idle()
+
+    def _show_stem_elapsed(self):
+        if getattr(self, "_stem_start", None) is None:
+            return
+        dt = time.time() - self._stem_start
+        self.stem_time_var.set(f"本次模拟耗时: {dt:.1f} s")
 
     # ------------------------------------------------------------------ 鼠标拖拽
     def _bind_left_mouse(self):
@@ -873,10 +1210,10 @@ class CBEDApp:
         # F = Rx(-dy·s) @ Ry(dx·s)，累加为 self.R_new = F @ self.R（而非旧的右乘
         # self.R @ F 的晶体系旋转——在面内 z 旋转非零时晶体系轴已被扭转，
         # 右乘会令屏幕上方向错误，见 _rotcheck.py 数值验证）。
-        # project_beam_aligned 强制束恒沿带轴：
-        #  · 向下拖（dy<0）：Rx(-dy·s) 绕 x 正向，上方 +y 侧（020）强激发；
-        #  · 向左拖（dx<0）：Ry(dx·s) 绕 y 负向，右方 +x 侧（200）强激发。
-        self.R = project_beam_aligned((Rx(-dy * s) @ Ry(dx * s)) @ self.R)
+        # 拖拽 = 绕实验室固定轴主动旋转晶体（束不动、晶体动，真实测角台式）：
+        #   · 向下拖（dy<0）：Rx(-dy·s) 绕 x 正向，上方 +y 侧（020）强激发；
+        #   · 向左拖（dx<0）：Ry(dx·s) 绕 y 负向，右方 +x 侧（200）强激发。
+        self.R = (Rx(-dy * s) @ Ry(dx * s)) @ self.R
         self._sync_zone_readout()
         # 节流：合并高频 motion 事件，约 60 fps 重绘一次，
         # 避免 diffsims 逐事件重算堆积导致卡顿、画面"一格一格"跳变。
@@ -923,6 +1260,7 @@ class CBEDApp:
         self.atoms = atoms
         self.cell = np.asarray(atoms.get_cell()[:], float)
         self.R = np.eye(3)
+        self._reset_tem_tilt_fields()
         self.g_list = build_g_list(self.cell, self.cfg["gmax"], self.cfg["max_hkl"])
         self.F2 = {hkl: structure_factor(hkl, g, atoms) ** 2
                    for hkl, g in self.g_list}
@@ -930,6 +1268,13 @@ class CBEDApp:
         self.F2 = {hkl: v / fmax for hkl, v in self.F2.items()}
         self._build_phase(cif_text)
         self.cif_label.set(name + f"  (a≈{np.linalg.norm(self.cell[0]):.3f} Å)")
+        fml, sg = self._read_formula_and_sg_symbol(cif_text)
+        if fml:
+            fml = fml.replace("_", "₂").replace("'", "")
+        if sg:
+            sg = sg.replace("'", "").strip()
+        info = ", ".join(x for x in (fml, sg) if x)
+        self.crystal_info_label.set(info)
         self._redraw_left()
 
     def _read_spacegroup_number(self, txt):
@@ -940,6 +1285,30 @@ class CBEDApp:
             if m:
                 return int(m.group(1))
         return 1
+
+    def _read_formula_and_sg_symbol(self, txt):
+        """从 CIF 文本读化学式(优先 _chemical_formula_structural)与空间群符号(H-M)。
+        任一项缺失则返回空串。"""
+        import re
+        formula = ""
+        for key in ("_chemical_formula_structural",
+                    "_chemical_formula_sum",
+                    "_chemical_formula_moiety"):
+            m = re.search(key + r"\s+[\"']?([^\"'\n]+)[\"']?", txt)
+            if m:
+                formula = m.group(1).strip()
+                if formula:
+                    break
+        sg = ""
+        for key in ("_space_group_name_H-M_alt",
+                    "_symmetry_space_group_name_H-M",
+                    "_space_group_name_H-M"):
+            m = re.search(key + r"\s+[\"']?([^\"'\n]+)[\"']?", txt)
+            if m:
+                sg = m.group(1).strip()
+                if sg:
+                    break
+        return formula, sg
 
     def _build_phase(self, cif_text):
         """用 diffpy/orix 从对齐后的晶胞构建 Phase，并新建 SimulationGenerator。"""
@@ -1004,6 +1373,9 @@ class CBEDApp:
             return
         v = v / nv
 
+        # 设带轴后倾转输入归零、基准清空：下次点电镜倾转时以新显示取向起算
+        self._reset_tem_tilt_fields()
+
         # 晶面指数 hkl：决定带轴取正后，哪个倒易方向 g 对准实验室 +x。
         hkl_base = tuple(0.0 for _ in self.hkl_vars)
         if getattr(self, "hkl_vars", None) is not None:
@@ -1052,11 +1424,12 @@ class CBEDApp:
             return
         # 面内旋转 = 绕电子束(实验室 z)旋转，作用在固定实验室轴（左乘），
         # 与拖拽/操控盘一致，避免晶体系右乘在面内角下的方向偏差
-        self.R = project_beam_aligned(Rz(np.deg2rad(-deg)) @ self.R)
+        self.R = Rz(np.deg2rad(-deg)) @ self.R
         self._redraw_left()
 
     def _on_reset(self):
         self.R = np.eye(3)
+        self._reset_tem_tilt_fields()
         self.uvw_vars[0].set("0")
         self.uvw_vars[1].set("0")
         self.uvw_vars[2].set("1")
@@ -1064,6 +1437,68 @@ class CBEDApp:
             self.hkl_vars[i].set(str(h))
         self.inplane_var.set("0.0")
         self._redraw_left()
+
+    # ------------------------------------------------------------- 电镜倾转
+    def _read_tem_tilt_angle(self, var, name):
+        try:
+            return float(var.get())
+        except (ValueError, AttributeError):
+            messagebox.showwarning("输入错误", f"{name} 须为数字 (°)")
+            return None
+
+    def _tem_tilt_rot(self, alpha_deg, beta_deg):
+        """双倾样品杆的倾转旋转：R_tilt = Rα(α) @ Rβ(β)（先 β 后 α）。
+
+        先绕 β 轴转（此时 α 未动，β 轴处于其真实方位），再绕 α 轴转（β 轴
+        随样品杆一起转过 α）——与样品杆的实际运动次序一致。两轴均取
+        实验室/绘图区固定方向（左乘列向量）。
+        """
+        d_a = np.asarray(TEM_TILT_AXES[self.tem_tilt_alpha_axis_var.get()], float)
+        d_b = np.asarray(TEM_TILT_AXES[self.tem_tilt_beta_axis_var.get()], float)
+        R_beta = rotation_about_axis(d_b, np.radians(beta_deg))
+        R_alpha = rotation_about_axis(d_a, np.radians(alpha_deg))
+        return R_alpha @ R_beta
+
+    def _on_set_current_tem_tilt(self):
+        """记录“当前花样对应的 α/β 倾转读数”——只记录，不旋转、不重绘。
+
+        把当前显示的取向解释成电镜 0 状态先 β 后 α 倾转后的状态，由此反推
+        0 状态：R_0 = [Rα(α) @ Rβ(β)]ᵀ @ R，供目标倾转面板起算。
+        """
+        a = self._read_tem_tilt_angle(self.tem_tilt_alpha_var, "α 倾转角")
+        b = self._read_tem_tilt_angle(self.tem_tilt_beta_var, "β 倾转角")
+        if a is None or b is None:
+            return
+        if self.atoms is None:
+            messagebox.showinfo("提示", "请先导入 CIF 文件")
+            return
+        self._tem_tilt_R0 = self._tem_tilt_rot(a, b).T @ self.R
+        self.tem_tilt_info_var.set(f"当前倾转：α = {a:g}°，β = {b:g}°")
+
+    def _on_set_target_tem_tilt(self):
+        """按目标 α/β 改变下方花样（从电镜 0 状态起算）。
+
+        未记录当前倾转时，把当前显示取向当作 0 状态（即 α = β = 0°）。
+        """
+        a = self._read_tem_tilt_angle(self.tem_tilt_target_alpha_var, "目标 α 倾转角")
+        b = self._read_tem_tilt_angle(self.tem_tilt_target_beta_var, "目标 β 倾转角")
+        if a is None or b is None:
+            return
+        if self.atoms is None:
+            messagebox.showinfo("提示", "请先导入 CIF 文件")
+            return
+        R0 = self.R.copy() if self._tem_tilt_R0 is None else self._tem_tilt_R0
+        self.R = self._tem_tilt_rot(a, b) @ R0
+        self._sync_zone_readout()
+        self._redraw_left()
+
+    def _reset_tem_tilt_fields(self):
+        """倾转基准改变（设带轴/重置/导入）后，倾转输入归零并清空记录。"""
+        for var in (self.tem_tilt_alpha_var, self.tem_tilt_beta_var,
+                    self.tem_tilt_target_alpha_var, self.tem_tilt_target_beta_var):
+            var.set("0.0")
+        self._tem_tilt_R0 = None
+        self.tem_tilt_info_var.set("尚未记录当前倾转（按 α = β = 0° 处理）")
 
     # ------------------------------------------------------------- 旋转操控盘
     def _draw_dial(self):
@@ -1143,8 +1578,7 @@ class CBEDApp:
         ang = mrad / 1000.0
         # 绕实验室/屏幕 XY 平面内的方向 d 旋转（左乘 self.R，同拖拽：
         # 施加面内 z 旋转后右乘会令晶体系轴扭转、方向错误，故用左乘）
-        self.R = project_beam_aligned(
-            rotation_about_axis(self._rot_axis(), ang) @ self.R)
+        self.R = rotation_about_axis(self._rot_axis(), ang) @ self.R
         self._set_rot_arrow_visible(True)
         self._redraw_left()
 
@@ -1348,10 +1782,11 @@ class CBEDApp:
                     fv = structure_factor(_h, _g, self.atoms) ** 2
                     if fv > f2ref:
                         f2ref = fv
-                # 系统消光/极弱反射：|F|² < 1%·f2ref 剔除（螺旋轴、滑移等规则）
-                extinct = (F2s >= 0.01 * f2ref) if f2ref > 0 else \
-                    np.ones(len(F2s), bool)
-                # 激发包络：Lorentzian env=1/(1+(s/σ)²)，s 为 Ewald 球激发误差。
+                # 显示规则：仅当 F=0（空间群系统消光，如螺旋轴/滑移产生的规则缺反射）
+                # 才不显示；其余一律保留。弱但允许的反射(如超结构(001))不再被 1% 强度
+                # 阈值删掉，改用 Gaussian 包络 env 让离带轴者平滑淡出。
+                nonzero = F2s > 1e-9
+                # 激发包络：Gaussian env=exp(-(s/σ)²)，s 为 Ewald 球激发误差。
                 # 束沿 -z 入射（k 矢量 = -k·ẑ）：s = |k+g| - |k|
                 # = sqrt(gperp² + (k-gz)²) - k，即对 gz 的符号与 +z 约定相反。
                 k = 1.0 / wavelength
@@ -1359,16 +1794,16 @@ class CBEDApp:
                             (k - g_lab[:, 2])**2) - k
                 sigma = self.cfg.get("exc_width",
                                      0.5 * self.cfg.get("exc_spot", 0.10))
-                env = 1.0 / (1.0 + (s / sigma) ** 2)
+                env = np.exp(-((s / sigma) ** 2))
                 # 激发误差硬门限：|s| ≥ exc_spot 的反射直接剔除（与 diffsims
                 # max_excitation_error 行为一致）。必须用 |s|：s 为负（Ewald 球
                 # 另一侧，如 [001] 带轴下 l>0 的反射 gz>0 在束 -z 约定下 s≈-gz）
                 # 同样远离 Bragg 条件，若只判 s<exc_spot 则负值恒通过，
                 # 导致大量弱斑涌入。
-                # 否则 Lorentzian 包络永不为 0，强反射但强离带轴的斑（如 [001]
+                # 否则 Gaussian 包络永不为 0，强反射但强离带轴的斑（如 [001]
                 # 下投影到中心的 (002)，F² 大但 |s|≈0.43）会以弱强度显示成白色
                 # 小点，叠在强斑/直射束上。
-                keep = inside & extinct & (np.abs(s) < self.cfg["exc_spot"])
+                keep = inside & nonzero & (np.abs(s) < self.cfg["exc_spot"])
                 kept = np.where(keep)[0]
                 X, Y, hkls = X[keep], Y[keep], HKL[keep]
                 F2k = F2s[keep]
@@ -1415,7 +1850,7 @@ class CBEDApp:
                     # 而非纯色圆。用 GREY_PHYS（浅灰→黑）而非 Greys：Greys 低端
                     # 是纯白，弱斑在白背景上会显成刺眼白点；浅灰起点让弱斑柔和。
                     # 相对强度 ratio（含亮度倍率）超出满标时颜色饱和到最黑，
-                    # 点大小封顶避免无限膨胀。
+                    # 点大小封顶避免无限膨胀。线性比例：弱斑偏浅灰、强斑近黑。
                     ratio = intens[diffuse] / mx
                     ax.scatter(X[diffuse], Y[diffuse], c=ratio,
                                s=8 + 70 * np.minimum(ratio, 1.0),
@@ -1492,6 +1927,19 @@ class CBEDApp:
             messagebox.showwarning("输入错误", f"{name} 需为数字")
             return None
 
+    def _update_nyq_half(self):
+        """实空间采样决定的奈奎斯特散射半角(mrad)，即 CBED 可见角上限。"""
+        try:
+            e_kev = float(self.energy_var.get())
+            s = float(self.sampling_var.get())
+            if e_kev <= 0 or s <= 0:
+                raise ValueError
+            lam = 12.26 / np.sqrt(e_kev * 1e3 * (1 + 9.78e-7 * e_kev * 1e3))
+            half = np.arcsin(lam / (4.0 * s)) * 1000.0  # 弧度直接×1000 → mrad
+            self._nyq_half_var.set(f"半角限 ≈{half:.0f} mrad")
+        except (ValueError, ZeroDivisionError):
+            self._nyq_half_var.set("")
+
     def _on_cbed(self):
         if self.atoms is None:
             messagebox.showinfo("提示", "请先导入 CIF 文件")
@@ -1522,7 +1970,9 @@ class CBEDApp:
             "当前带轴:", "").strip()
 
         self._running = True
+        self._cancel_event.clear()   # 本次新模拟开始时复位取消标志
         self.cbed_btn.config(state="disabled")
+        self.cbed_cancel_btn.config(state="normal")
         self.cbed_status.set("计算中…（大超胞/厚样品可能需数分钟）")
         self.cbed_time_var.set("")
         self._cbed_start = time.time()
@@ -1530,6 +1980,28 @@ class CBEDApp:
         t = threading.Thread(target=self._cbed_worker, args=(params,), daemon=True)
         t.start()
         self.root.after(150, self._poll_result)
+
+    def _cancel_cbed(self):
+        """请求取消本次 CBED 模拟。worker 在关键步骤检查标志后尽快返回。"""
+        if not self._running:
+            return
+        self._cancel_event.set()
+        self.cbed_status.set("正在取消…")
+        self.cbed_btn.config(state="disabled")
+        self.cbed_cancel_btn.config(state="disabled")
+        # worker 取消时直接 return 不向队列写结果 → poll 永远不会复位。
+        # 这里轮询等线程结束（daemon 线程），再手动复位 UI。
+        self.root.after(60, self._finish_cancel)
+
+    def _finish_cancel(self):
+        # 没有好办法在 tk 线程里拿到 worker 线程对象本身已句柄，等它结束靠
+        # running 仍为 True + 已置取消标志即可复位。为简单起见取消即复位：
+        # worker 是 daemon 且会在下次检查点退出，让出主线程时间片后复位。
+        self._running = False
+        self.cbed_btn.config(state="normal")
+        self.cbed_cancel_btn.config(state="disabled")
+        self.cbed_status.set("已取消")
+        self._show_elapsed()
 
     def _cbed_worker(self, params):
         try:
@@ -1589,7 +2061,11 @@ class CBEDApp:
                                 sampling=sampling)   # 束沿 +z（＝带轴），无需 tilt
             # lazy=False：即时计算，避免斜晶胞大网格触发 dask 自动分块失败
             # (RuntimeError: Object cannot be automatically chunked)
+            if self._cancel_event.is_set():
+                return
             exit_waves = probe.multislice(potential, lazy=False)
+            if self._cancel_event.is_set():
+                return
             patterns = exit_waves.diffraction_patterns(
                 max_angle=params["max_angle_mrad"])
             arr = np.asarray(patterns.array)
@@ -1690,6 +2166,11 @@ class CBEDApp:
             return
         self._running = False
         self.cbed_btn.config(state="normal")
+        self.cbed_cancel_btn.config(state="disabled")
+        # 竞态防护：worker 若在取消前越过检查点仍可能写入结果；取消标志已置
+        # 则丢弃，保持"已取消"状态不变。
+        if self._cancel_event.is_set():
+            return
 
         if msg[0] == "err":
             self.cbed_status.set("失败")
